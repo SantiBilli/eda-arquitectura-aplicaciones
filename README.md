@@ -8,7 +8,7 @@ Este repositorio documenta un flujo **event-driven** que orquesta la creación y
 
 ---
 
-## 🗺️ Arquitectura (alto nivel)
+## 🗺️ Arquitectura
 ![Arquitectura del flujo (alto nivel)](Arquitectura.png)
 
 ---
