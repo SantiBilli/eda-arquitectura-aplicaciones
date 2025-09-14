@@ -29,8 +29,6 @@ Este repositorio documenta un flujo **event-driven** que orquesta la creación y
 - `LOGISTICA` – aviso para confirmar despacho.
 - `SUCURSALES` – **demo**: un solo topic; el correo incluye el nombre de sucursal.
 
-> ⚠️ **SES Sandbox / SNS Email**: si usás correos por email, asegurate de **confirmar las suscripciones** y/o **verificar** remitentes/destinatarios si tu cuenta está en *sandbox*.
-
 ### API Gateway (HTTP API v2)
 
 | Método/Path | Lambda | Propósito |
