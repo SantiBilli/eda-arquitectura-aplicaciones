@@ -9,28 +9,6 @@ Este repositorio documenta un flujo **event-driven** que orquesta la creación y
 ---
 
 ## 🗺️ Arquitectura (alto nivel)
-
-```mermaid
-flowchart LR
-    A[Cliente/API] -->|POST /ordenes-compra| L1[Lambda Compras-CrearOrden-CasaCentral]
-    L1 -->|Event: OrdenCreada| EB[(EventBridge ventas-bus)]
-    EB -->|OrdenCreada| L2[CasaCentral-ProcesarOrden-Deposito]
-    L2 -->|Event: OrdenProcesada| EB
-    EB -->|OrdenProcesada| L3[Notificaciones-OC (pendiente)]
-    L3 -->|Event: OrdenPendienteAprobacion| EB
-    EB -->|OrdenPendienteAprobacion| L4[Notificador SNS Aprobadores]
-    A -->|GET /approvals/{id}/approve| L5[CasaCentral-AprobarOrden]
-    A -->|GET /approvals/{id}/reject| L6[CasaCentral-RechazarOrden]
-    L5 -->|Event: OrdenAprobada| EB
-    EB -->|OrdenAprobada| L7[Notificaciones-Proveedor]
-    EB -->|OrdenAprobada| L8[Notificación-Depósito]
-    A -->|GET /recepciones/{id}/accept| L9[Deposito-AceptarRecepcion]
-    L9 -->|Update Stock + Event: RecepcionRecibida| EB
-    EB -->|RecepcionRecibida| L10[Notificación-Logística]
-    A -->|GET /despachos/{id}/confirm| L11[Logistica-ConfirmarDespacho]
-    L11 -->|Update Envios + Restar Stock + Event: DespachoConfirmado| EB
-```
-
 ---
 
 ## 📦 Componentes
