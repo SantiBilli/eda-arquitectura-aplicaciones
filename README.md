@@ -1,207 +1,145 @@
 # Retail Deportivo – Flujo de Compras, Depósito y Logística (AWS)
 
-> **Stack:** API Gateway (HTTP API v2) · AWS Lambda · EventBridge · DynamoDB · SNS
+> **Stack:** API Gateway (HTTP API v2) · AWS Lambda · EventBridge · DynamoDB · SNS  
 > **Región:** `us-east-2`  
 > **Bus de eventos:** `ventas-bus`
 
-Este repositorio documenta un flujo **event-driven** que orquesta la creación y aprobación de **Órdenes de Compra (OC)**, su **recepción en Depósito**, actualización de **Stock Global**, y **despacho** con notificaciones por **SNS**.
+Este repositorio documenta un flujo **event-driven** que orquesta la creación y aprobación de **Órdenes de Compra (OC)**, su **recepción en Depósito**, actualización de **Stock Global**, **despacho** y **notificaciones** por **SNS** hacia aprobadores, proveedor, depósito, logística y sucursales.
 
 ---
 
-## 🗺️ Arquitectura
+## 🗺️ Arquitectura (alto nivel)
 ![Arquitectura del flujo (alto nivel)](Arquitectura.png)
 
 ---
 
-## 📦 Componentes
+## 🔄 Flujo end-to-end
 
-### DynamoDB
+1) **Crear OC**  
+   `POST /ordenes-compra` → **Compras-CrearOrden-CasaCentral**  
+   - Guarda OC en `OrdenesCompra` con `status=CREATED`.  
+   - Emite **`OrdenCreada`**.
+
+2) **Procesar OC**  
+   **CasaCentral-ProcesarOrden-Deposito** (rule: `OrdenCreada`)  
+   - Cambia `status=PENDING_APPROVAL`.  
+   - Emite **`OrdenPendienteAprobacion`**.
+
+3) **Notificar Aprobadores**  
+   **Notificaciones-OC** (rule: `OrdenPendienteAprobacion`)  
+   - Envía mail (SNS) con links:  
+     - `GET /approvals/{orderId}/approve` → **CasaCentral-AprobarOrden**  
+     - `GET /approvals/{orderId}/reject`  → **CasaCentral-RechazarOrden**
+
+4) **Aprobar OC**  
+   **CasaCentral-AprobarOrden** (endpoint)  
+   - Cambia `status=APPROVED`.  
+   - Emite **`OrdenAprobada`** → 2 reglas:  
+     - **Notificaciones-Proveedor** (envía detalle a proveedor).  
+     - **Notificacion-Deposito** (envía link de recepción).
+
+5) **Rechazar OC**  
+   **CasaCentral-RechazarOrden** (endpoint)  
+   - Cambia `status=REJECTED`.  
+   - (Opcional) Emite `OrdenRechazada`.
+
+6) **Aceptar Recepción (Depósito)**  
+   `GET /recepciones/{orderId}/accept` → **Deposito-AceptarRecepcion**  
+   - Cambia `status=RECEIVED`.  
+   - Suma stock por SKU en **StockGlobal**.  
+   - Emite **`RecepcionRecibida`**.
+
+7) **Notificar Logística**  
+   **Notificacion-Logistica** (rule: `RecepcionRecibida`)  
+   - Envía mail (SNS) con link:  
+     - `GET /despachos/{orderId}/confirm` → **Logistica-ConfirmarDespacho**
+
+8) **Confirmar Despacho (Logística)**  
+   **Logistica-ConfirmarDespacho** (endpoint)  
+   - Upsert en **Envios** (`envioId = orderId`, `status=DISPATCH_CONFIRMED`).  
+   - **Resta** stock en **StockGlobal** por SKU (si no alcanza, deja `qty=0`).  
+   - Emite **`DespachoConfirmado`**.
+
+9) **Notificar Sucursales** (demo)  
+   **Notificaciones-Sucursales** (rule: `DespachoConfirmado`)  
+   - Envía **N** mails (SNS) al **mismo topic** usando el nombre de sucursal en el asunto/cuerpo.  
+   - Sucursales se eligen aleatoriamente (2 o 3) de `SUCURSALES_DEFAULT`.
+
+---
+
+## 📦 Tablas DynamoDB
 
 | Tabla | PK | Uso | Campos relevantes |
 |---|---|---|---|
-| **OrdenesCompra** | `orderId` (S) | OC y su ciclo | `status` (`CREATED`, `PROCESSED`, `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `RECEIVED`), `items` (lista o string JSON), `origen`, timestamps varios |
+| **OrdenesCompra** | `orderId` (S) | OC y su ciclo | `status` (`CREATED`, `PENDING_APPROVAL`, `APPROVED`, `REJECTED`, `RECEIVED`), `items` (lista o string JSON), `origen`, `createdAt`, `updatedAt`, `approvedAt`, `receivedAt` |
 | **StockGlobal** | `sku` (S) | Stock por SKU | `qty` (Number), `updatedAt`, `lastOrderId` |
 | **Envios** | `envioId` (S) = `orderId` | Despachos | `orderId`, `status` (`DISPATCH_CONFIRMED`), `sucursales` (demo), `dispatchedAt`, `confirmedBy` |
 
-### SNS (tópicos)
+> Nota: en el diseño final **no** persistimos “Sucursales” como tabla; solo notificamos por SNS (demo). Si futuro necesitás inventario por sucursal, agregá tabla `Sucursales`.
 
-- `COMPRAS_APROBADORES` – notifica a aprobadores (con links de aprobar/rechazar).
-- `PROVEEDORES` – detalle de OC aprobada para el proveedor.
-- `DEPOSITO` – aviso para confirmar recepción.
-- `LOGISTICA` – aviso para confirmar despacho.
-- `SUCURSALES` – **demo**: un solo topic; el correo incluye el nombre de sucursal.
+---
 
-### API Gateway (HTTP API v2)
+## 📣 SNS (tópicos)
+
+- **COMPRAS_APROBADORES** – aprobadores (links de aprobar/rechazar).
+- **PROVEEDORES** – detalle de OC aprobada.
+- **DEPOSITO** – aviso con link para confirmar recepción.
+- **LOGISTICA** – aviso con link para confirmar despacho.
+- **SUCURSALES** – **demo**: un único topic que te llega a vos; el mensaje incluye el nombre de sucursal.
+
+---
+
+## 🌐 API Gateway (HTTP API v2)
 
 | Método/Path | Lambda | Propósito |
 |---|---|---|
-| `POST /ordenes-compra` | `Compras-CrearOrden-CasaCentral` | Crear OC (status `CREATED`) y emitir `OrdenCreada` |
-| `GET /approvals/{orderId}/approve` | `CasaCentral-AprobarOrden` | Aprobar OC (`APPROVED`) y emitir `OrdenAprobada` |
-| `GET /approvals/{orderId}/reject` | `CasaCentral-RechazarOrden` | Rechazar OC (`REJECTED`) y emitir `OrdenRechazada` |
-| `GET /recepciones/{orderId}/accept` | `Deposito-AceptarRecepcion` | Marcar OC `RECEIVED` + sumar stock + `RecepcionRecibida` |
-| `GET /despachos/{orderId}/confirm` | `Logistica-ConfirmarDespacho` | Upsert en `Envios`, **restar stock** y `DespachoConfirmado` |
+| `POST /ordenes-compra` | **Compras-CrearOrden-CasaCentral** | Crear OC (`CREATED`) + `OrdenCreada` |
+| `GET /approvals/{orderId}/approve` | **CasaCentral-AprobarOrden** | Aprobar (`APPROVED`) + `OrdenAprobada` |
+| `GET /approvals/{orderId}/reject` | **CasaCentral-RechazarOrden** | Rechazar (`REJECTED`) + (opcional) `OrdenRechazada` |
+| `GET /recepciones/{orderId}/accept` | **Deposito-AceptarRecepcion** | `RECEIVED` + sumar Stock + `RecepcionRecibida` |
+| `GET /despachos/{orderId}/confirm` | **Logistica-ConfirmarDespacho** | Upsert `Envios`, restar Stock, `DespachoConfirmado` |
 
-### EventBridge (bus: `ventas-bus`)
+---
 
-| Regla | Filtro (source / detail-type) | Destino |
+## ⏰ EventBridge (bus: `ventas-bus`)
+
+| Regla | Filtro (source / detail-type) | Target |
 |---|---|---|
-| `OrdenCreada` | `com.casacentral.compras` / `OrdenCreada` | `CasaCentral-ProcesarOrden-Deposito` |
-| `OrdenProcesada` | `com.casacentral.procesos` / `OrdenProcesada` | `Notificaciones-OC` (set `PENDING_APPROVAL` + evento) |
-| `Notificaciones-OC` | `com.casacentral.procesos` / `OrdenPendienteAprobacion` | Notificador Aprobadores (SNS) |
-| `Notificaciones-Proveedor` | `com.casacentral.aprobaciones` / `OrdenAprobada` | `Notificaciones-Proveedor` |
-| `Notificacion-Deposito` | `com.casacentral.aprobaciones` / `OrdenAprobada` | `Notificacion-Deposito-A-R` |
-| `RecepcionPreparada` | `com.deposito.recepcion` / `RecepcionRecibida` | Notificación/Logística (u otros pasos) |
+| **OrdenCreada** | `com.casacentral.compras` / `OrdenCreada` | `CasaCentral-ProcesarOrden-Deposito` |
+| **PendienteAprobacion** | `com.casacentral.procesos` / `OrdenPendienteAprobacion` | `Notificaciones-OC` |
+| **Aprobada→Proveedor** | `com.casacentral.aprobaciones` / `OrdenAprobada` | `Notificaciones-Proveedor` |
+| **Aprobada→Deposito** | `com.casacentral.aprobaciones` / `OrdenAprobada` | `Notificacion-Deposito` |
+| **RecepcionRecibida** | `com.deposito.recepcion` / `RecepcionRecibida` | `Notificacion-Logistica` |
+| **DespachoConfirmado** | `com.logistica.despacho` / `DespachoConfirmado` | `Notificaciones-Sucursales` |
+
+> **Importante:** usar exactamente esos `source`/`detail-type` para que las reglas disparen.
 
 ---
 
-## 🔁 Contratos de eventos
+## 📨 Contratos de eventos
 
-<details>
-<summary><strong>OrdenCreada</strong></summary>
-
-```json
-{
-  "Source": "com.casacentral.compras",
-  "DetailType": "OrdenCreada",
-  "Detail": {
-    "orderId": "OC-1001",
-    "items": [{"sku": "ABC-123", "qty": 2}],
-    "origen": "CasaCentral"
-  }
-}
-```
-</details>
-
-<details>
-<summary><strong>OrdenProcesada</strong></summary>
-
-```json
-{
-  "Source": "com.casacentral.procesos",
-  "DetailType": "OrdenProcesada",
-  "Detail": {"orderId":"OC-1001","status":"PROCESSED"}
-}
-```
-</details>
-
-<details>
-<summary><strong>OrdenPendienteAprobacion</strong></summary>
-
-```json
-{
-  "Source": "com.casacentral.procesos",
-  "DetailType": "OrdenPendienteAprobacion",
-  "Detail": {
-    "orderId": "OC-1001",
-    "ROL": "CasaCentral",
-    "audienceRoles": ["COMPRAS_APROBADORES"]
-  }
-}
-```
-</details>
-
-<details>
-<summary><strong>OrdenAprobada</strong></summary>
-
-```json
-{
-  "Source": "com.casacentral.aprobaciones",
-  "DetailType": "OrdenAprobada",
-  "Detail": {"orderId":"OC-1001","approvedAt":"<ISO8601>"}
-}
-```
-</details>
-
-<details>
-<summary><strong>RecepcionRecibida</strong></summary>
-
-```json
-{
-  "Source": "com.deposito.recepcion",
-  "DetailType": "RecepcionRecibida",
-  "Detail": {"orderId":"OC-1001","receivedAt":"<ISO8601>","status":"RECEIVED"}
-}
-```
-</details>
-
-<details>
-<summary><strong>DespachoConfirmado</strong></summary>
-
-```json
-{
-  "Source": "com.logistica.despacho",
-  "DetailType": "DespachoConfirmado",
-  "Detail": {"orderId":"OC-1001","envioId":"OC-1001","dispatchedAt":"<ISO8601>","status":"DISPATCH_CONFIRMED"}
-}
-```
-</details>
+(ver detalle en la conversación)
 
 ---
 
-## ⚙️ Variables de entorno
+## ⚙️ Variables de entorno (por Lambda)
 
-> Configurarlas en cada Lambda según corresponda.
-
-| Variable | Ejemplo / Notas |
-|---|---|
-| `ORDERS_TABLE` | `OrdenesCompra` |
-| `STOCK_TABLE` | `StockGlobal` |
-| `ENVIOS_TABLE` | `Envios` |
-| `EVENT_BUS` | `ventas-bus` |
-| `EVENT_SOURCE` | p.ej. `com.casacentral.aprobaciones`, `com.deposito.recepcion`, `com.logistica.despacho` |
-| `APPROVAL_BASE_URL` | Base de API para links de aprobación (notificador) |
-| `API_BASE_URL` | Base de API para links de recepción/despacho |
-| `ROLE_TOPIC_MAP` | JSON con roles→ARNs, p.ej. `{"COMPRAS_APROBADORES":"arn:...:COMPRAS_APROBADORES"}` |
-| `PROVEEDORES` / `DEPOSITO` / `LOGISTICA` / `SUCURSALES` | ARN del topic SNS correspondiente |
+(ver tabla completa en la conversación)
 
 ---
 
-## 🔐 Permisos (IAM mínimos por Lambda)
+## 🔐 Permisos IAM (mínimos)
 
-- **DynamoDB:** `GetItem`, `PutItem`, `UpdateItem` sobre tablas usadas.
-- **EventBridge:** `events:PutEvents` sobre `ventas-bus`.
-- **SNS (notificadores):** `sns:Publish` sobre los Topic ARN configurados.
-- **Logs:** permisos estándar de CloudWatch Logs.
+- **DynamoDB:** `GetItem`, `PutItem`, `UpdateItem` en las tablas usadas.  
+- **EventBridge:** `events:PutEvents` al `ventas-bus`.  
+- **SNS:** `sns:Publish` a los topics configurados.  
+- **Logs:** CloudWatch Logs estándar.
 
 ---
 
 ## 🚀 Cómo probar (end-to-end)
 
-1. **Crear una orden**
-   ```bash
-   curl -X POST https://<api-id>.execute-api.us-east-2.amazonaws.com/ordenes-compra \
-     -H 'Content-Type: application/json' \
-     -d '{
-       "orderId": "OC-1001",
-       "items": [{"sku":"ABC-123","qty":2},{"sku":"XYZ-999","qty":1}],
-       "origen": "CasaCentral"
-     }'
-   ```
-
-2. **Aprobación por link de email** (o directo por curl)
-   ```bash
-   curl "https://<api-id>.execute-api.us-east-2.amazonaws.com/approvals/OC-1001/approve"
-   # o para rechazo:
-   curl "https://<api-id>.execute-api.us-east-2.amazonaws.com/approvals/OC-1001/reject?reason=Sin%20presupuesto"
-   ```
-
-3. **Recepción (Depósito)**
-   ```bash
-   curl "https://<api-id>.execute-api.us-east-2.amazonaws.com/recepciones/OC-1001/accept"
-   ```
-   - Actualiza `OrdenesCompra.status = RECEIVED`
-   - Suma stock en `StockGlobal` por cada `sku`
-   - Emite `RecepcionRecibida`
-   - (Notifica a Logística si está configurado)
-
-4. **Confirmar despacho (Logística)**
-   ```bash
-   curl "https://<api-id>.execute-api.us-east-2.amazonaws.com/despachos/OC-1001/confirm"
-   ```
-   - Upsert en `Envios` (`envioId = orderId`)
-   - **Resta** stock en `StockGlobal` (si no alcanza, deja `qty=0`)
-   - Emite `DespachoConfirmado`
-   - (Demo) Notifica a `SUCURSALES`
+(ver pasos en la conversación)
 
 ---
 
@@ -211,9 +149,9 @@ Este repositorio documenta un flujo **event-driven** que orquesta la creación y
 {
   "orderId": "OC-1001",
   "items": [
-    {"sku": "ABC-123", "qty": 2},
-    {"sku": "XYZ-999", "qty": 1}
+    {"sku": "ABC-1234", "qty": 24},
+    {"sku": "XYZ-999", "qty": 92}
   ],
-  "origen": "CasaCentral"
+  "origen": "Compras"
 }
 ```
