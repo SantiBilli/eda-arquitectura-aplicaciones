@@ -1,4 +1,4 @@
-# Retail Deportivo – Flujo de Compras, Depósito y Logística (AWS)
+# NBA – Flujo de Compras, Depósito y Logística (AWS)
 
 > **Stack:** API Gateway (HTTP API v2) · AWS Lambda · EventBridge · DynamoDB · SNS  
 > **Región:** `us-east-2`  
